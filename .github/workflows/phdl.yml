@@ -1,0 +1,140 @@
+name: Super Video Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'لینک ویدیو یا صفحه حاوی ویدیو'
+        required: true
+        type: string
+      cookies:
+        description: 'Cookies (اختیاری - برای سایت‌های قفل شده)'
+        required: false
+        type: string
+        default: ''
+      quality:
+        description: 'کیفیت (best, 1080p, 720p, worst)'
+        required: false
+        type: string
+        default: 'best'
+      output_folder:
+        description: 'پوشه ذخیره در مخزن'
+        required: false
+        type: string
+        default: 'downloads'
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  smart-download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Python + Tools
+        run: |
+          pip install -U yt-dlp requests
+          sudo apt-get update
+          sudo apt-get install -y wget curl rar ffmpeg
+
+      - name: آماده سازی هدرها و کوکی
+        id: prepare
+        run: |
+          mkdir -p "${{ github.event.inputs.output_folder }}"
+          
+          # ساخت فایل کوکی اگه کاربر داده باشه
+          if [ -n "${{ github.event.inputs.cookies }}" ]; then
+            echo "${{ github.event.inputs.cookies }}" > cookies.txt
+            COOKIE_ARG="--cookies cookies.txt"
+          else
+            COOKIE_ARG=""
+          fi
+          
+          echo "cookie_arg=$COOKIE_ARG" >> $GITHUB_OUTPUT
+
+      - name: دانلود هوشمند با ۳ روش مختلف
+        id: download
+        continue-on-error: false
+        run: |
+          cd "${{ github.event.inputs.output_folder }}"
+          URL="${{ github.event.inputs.url }}"
+          
+          # روش اول: yt-dlp با کوکی و هدرهای قوی
+          yt-dlp \
+            ${{ steps.prepare.outputs.cookie_arg }} \
+            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+            --referer "$URL" \
+            --add-header "Accept: video/webm,video/mp4,video/*;q=0.9,*/*;q=0.8" \
+            --add-header "Accept-Language: en-US,en;q=0.9" \
+            --add-header "Sec-Fetch-Dest: video" \
+            --add-header "Sec-Fetch-Mode: navigate" \
+            --add-header "Sec-Fetch-Site: same-origin" \
+            --output "%(title)s - %(id)s.%(ext)s" \
+            --format "${{ github.event.inputs.quality }}" \
+            --merge-output-format mp4 \
+            --retries 10 \
+            --fragment-retries 20 \
+            --skip-unavailable-fragments \
+            --no-check-certificate \
+            --geo-bypass \
+            --sleep-requests 1 \
+            --min-sleep-interval 5 \
+            --max-sleep-interval 10 \
+            "$URL" && DOWNLOADED=1 || DOWNLOADED=0
+          
+          # روش دوم: اگه روش اول جواب نداد، با wget و هدرهای مستقیم
+          if [ $DOWNLOADED -eq 0 ]; then
+            echo "روش اول جواب نداد، روش دوم با wget..."
+            wget --user-agent="Mozilla/5.0" \
+                 --referer="$URL" \
+                 --header="Accept: video/mp4" \
+                 --tries=10 \
+                 --timeout=30 \
+                 --continue \
+                 "$URL" -O "video.mp4" && DOWNLOADED=1 || DOWNLOADED=0
+          fi
+          
+          # روش سوم: اگه هیچکدوم جواب نداد، با curl خام
+          if [ $DOWNLOADED -eq 0 ]; then
+            echo "روش دوم هم جواب نداد، روش سوم با curl..."
+            curl -L -b cookies.txt -c cookies.txt \
+                 -H "User-Agent: Mozilla/5.0" \
+                 -H "Referer: $URL" \
+                 -H "Accept: video/mp4" \
+                 --retry 10 \
+                 --retry-delay 5 \
+                 -o "video_fallback.mp4" \
+                 "$URL" && DOWNLOADED=1 || DOWNLOADED=0
+          fi
+          
+          if [ $DOWNLOADED -eq 0 ]; then
+            echo "❌ دانلود با همه روش‌ها失敗 شد"
+            exit 1
+          fi
+          
+          # پیدا کردن فایل دانلود شده
+          DOWNLOADED_FILE=$(ls -t *.mp4 2>/dev/null | head -1)
+          echo "downloaded_file=$DOWNLOADED_FILE" >> $GITHUB_OUTPUT
+          echo "✅ دانلود شد: $DOWNLOADED_FILE"
+
+      - name: آپلود به عنوان Artifact (امن‌ترین روش)
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-file
+          path: ${{ github.event.inputs.output_folder }}/${{ steps.download.outputs.downloaded_file }}
+          retention-days: 90
+          compression-level: 0
+
+      - name: Commit & Push به مخزن
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "actions@github.com"
+          git add "${{ github.event.inputs.output_folder }}/"
+          git commit -m "Add downloaded video [skip ci]" || echo "Nothing new to commit"
+          git push || echo "Push failed (maybe no changes)"
