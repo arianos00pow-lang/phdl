@@ -1,0 +1,76 @@
+name: Download from Default Player Page
+
+on:
+  workflow_dispatch:
+    inputs:
+      page_url:
+        description: 'آدرس کامل صفحه‌ای که پلیر در آن قرار دارد (مثل لینکی که فرستادید)'
+        required: true
+        type: string
+      quality:
+        description: 'کیفیت مورد نظر (best, 1080p, 720p, worst)'
+        required: false
+        type: string
+        default: 'best'
+
+jobs:
+  smart-download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg jq
+          pip install yt-dlp
+
+      - name: Extract real video URL from the player page
+        id: extract
+        run: |
+          PAGE_URL="${{ github.event.inputs.page_url }}"
+          echo "🔍 Analyzing player page: $PAGE_URL"
+
+          # روش طلایی: استفاده از yt-dlp برای استخراج لینک واقعی
+          # yt-dlp خودش صفحه را تحلیل کرده و بهترین لینک را پیدا می‌کند
+          REAL_URL=$(yt-dlp --get-url --format "${{ github.event.inputs.quality }}" "$PAGE_URL" 2>/dev/null | head -1)
+
+          # اگر روش اول جواب نداد، از ffmpeg برای کشف جریان استفاده می‌کنیم
+          if [ -z "$REAL_URL" ]; then
+            echo "yt-dlp failed, trying ffmpeg..."
+            
+            # دانلود موقتی صفحه HTML برای تحلیل
+            wget -O player.html "$PAGE_URL"
+            
+            # جستجوی هر گونه لینک حاوی .mp4 یا .m3u8 در صفحه
+            REAL_URL=$(cat player.html | grep -oP 'https?://[^\s"'\'']+\.(mp4|m3u8)[^\s"'\'']*' | head -1)
+          fi
+
+          if [ -z "$REAL_URL" ]; then
+            echo "❌ Could not extract video URL from page."
+            exit 1
+          fi
+
+          echo "✅ Real video URL found: $REAL_URL"
+          echo "real_url=$REAL_URL" >> $GITHUB_OUTPUT
+
+      - name: Download video using the real URL
+        run: |
+          REAL_URL="${{ steps.extract.outputs.real_url }}"
+          
+          # دانلود با yt-dlp برای بالاترین پایداری
+          yt-dlp -f "${{ github.event.inputs.quality }}" -o "final_video.mp4" "$REAL_URL"
+          
+          # بررسی موفقیت دانلود
+          if [ -f "final_video.mp4" ] && [ $(stat -c%s "final_video.mp4") -gt 100000 ]; then
+            echo "✅ Download successful! File size: $(stat -c%s final_video.mp4) bytes"
+          else
+            echo "❌ Download failed."
+            exit 1
+          fi
+
+      - name: Upload final video artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: downloaded-video
+          path: final_video.mp4
+          retention-days: 90
